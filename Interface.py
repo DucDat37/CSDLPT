@@ -5,12 +5,12 @@
 
 import psycopg2
 
-# Các hằng số cho tên bảng và cột
-RANGE_TABLE_PREFIX = 'range_part'
-RROBIN_TABLE_PREFIX = 'rrobin_part'
-USER_ID_COLNAME = 'userid'
-MOVIE_ID_COLNAME = 'movieid'
-RATING_COLNAME = 'rating'
+# Các hằng số định nghĩa prefix và tên cột
+RANGE_TABLE_PREFIX = 'range_part'  # Prefix cho tên bảng phân vùng theo khoảng giá trị
+RROBIN_TABLE_PREFIX = 'rrobin_part'  # Prefix cho tên bảng phân vùng theo round-robin
+USER_ID_COLNAME = 'userid'  # Tên cột chứa ID của user
+MOVIE_ID_COLNAME = 'movieid'  # Tên cột chứa ID của movie
+RATING_COLNAME = 'rating'  # Tên cột chứa giá trị rating
 
 def getopenconnection(dbname='postgres'):
     """
@@ -58,7 +58,6 @@ def getopenconnection(dbname='postgres'):
         print(e)
         raise e
 
-
 def loadratings(ratingstablename, ratingsfilepath, openconnection):
     """
     Hàm đọc dữ liệu từ file và load vào bảng ratings trong database
@@ -95,6 +94,7 @@ def loadratings(ratingstablename, ratingsfilepath, openconnection):
     - Hàm sử dụng COPY để load dữ liệu nhanh hơn so với INSERT
     """
     try:
+        # Tạo cursor để thực thi các câu lệnh SQL
         cur = openconnection.cursor()
         
         # Tạo bảng ratings với cấu trúc tối ưu
@@ -173,6 +173,33 @@ def rangepartition(ratingstablename, numberofpartitions, openconnection):
     """
     Function to create partitions of main table based on range of ratings.
     Sử dụng truy vấn SQL để phân mảnh dựa trên khoảng giá trị của rating
+    
+    Thuật toán phân vùng theo khoảng giá trị:
+    1. Tính toán khoảng giá trị cho mỗi phân vùng:
+       - Khoảng giá trị rating là từ 0 đến 5.0
+       - Chia đều khoảng này thành numberofpartitions phần
+       - Delta = 5.0/numberofpartitions là độ rộng của mỗi khoảng
+    
+    2. Tạo các bảng con:
+       - Mỗi bảng con có prefix 'range_part'
+       - Cấu trúc bảng: userid, movieid, rating
+       - Tên bảng: range_part0, range_part1, ...
+    
+    3. Phân phối dữ liệu:
+       - Phân vùng 0: [0, delta] - chứa các rating từ 0 đến delta
+       - Phân vùng 1: (delta, 2*delta] - chứa các rating từ delta đến 2*delta
+       - Phân vùng 2: (2*delta, 3*delta] - chứa các rating từ 2*delta đến 3*delta
+       - ...
+       - Phân vùng cuối: ((n-1)*delta, 5.0] - chứa các rating từ (n-1)*delta đến 5.0
+    
+    4. Ưu điểm:
+       - Phân phối dữ liệu đều theo giá trị rating
+       - Dễ dàng tìm kiếm theo khoảng giá trị
+       - Hiệu quả cho các truy vấn có điều kiện trên rating
+    
+    5. Nhược điểm:
+       - Có thể dẫn đến phân phối không đều nếu dữ liệu tập trung ở một khoảng
+       - Cần tính toán lại khi thêm/xóa phân vùng
     """
     con = openconnection
     cur = con.cursor()
@@ -220,6 +247,35 @@ def roundrobinpartition(ratingstablename, numberofpartitions, openconnection):
     """
     Function to create partitions of main table using round robin approach.
     Sử dụng truy vấn SQL để phân mảnh dữ liệu theo round robin
+    
+    Thuật toán phân vùng theo round-robin:
+    1. Nguyên lý hoạt động:
+       - Phân phối dữ liệu luân phiên vào các bảng con
+       - Mỗi bản ghi được gán một số thứ tự (row_num)
+       - Bảng con được chọn dựa trên phép chia lấy dư: row_num % numberofpartitions
+    
+    2. Tạo các bảng con:
+       - Mỗi bảng con có prefix 'rrobin_part'
+       - Cấu trúc bảng: userid, movieid, rating
+       - Tên bảng: rrobin_part0, rrobin_part1, ...
+    
+    3. Phân phối dữ liệu:
+       - Bản ghi 0 -> rrobin_part0
+       - Bản ghi 1 -> rrobin_part1
+       - Bản ghi 2 -> rrobin_part2
+       - ...
+       - Bản ghi n -> rrobin_part(n % numberofpartitions)
+    
+    4. Ưu điểm:
+       - Phân phối dữ liệu đều giữa các bảng con
+       - Không phụ thuộc vào giá trị của dữ liệu
+       - Dễ dàng thêm/xóa phân vùng
+       - Hiệu quả cho các truy vấn song song
+    
+    5. Nhược điểm:
+       - Không tối ưu cho các truy vấn có điều kiện trên rating
+       - Cần quét tất cả các bảng con khi tìm kiếm theo giá trị
+       - Khó khăn trong việc tìm kiếm theo khoảng giá trị
     """
     con = openconnection
     cur = con.cursor()
@@ -235,7 +291,7 @@ def roundrobinpartition(ratingstablename, numberofpartitions, openconnection):
                 rating FLOAT
             )
         """)
-
+        
     # Phân phối dữ liệu theo round robin
     query = f"""
     DO $$
@@ -269,6 +325,25 @@ def roundrobininsert(ratingstablename, userid, itemid, rating, openconnection):
     """
     Function to insert a new row into the main table and specific partition based on round robin
     approach.
+    
+    Parameters:
+    -----------
+    ratingstablename : str
+        Tên bảng ratings
+    userid : int
+        ID của user
+    itemid : int
+        ID của movie
+    rating : float
+        Giá trị rating
+    openconnection : psycopg2.extensions.connection
+        Kết nối đến database
+        
+    Notes:
+    -----
+    - Insert bản ghi vào bảng chính
+    - Xác định bảng con cần insert dựa trên số lượng bản ghi
+    - Insert vào bảng con tương ứng
     """
     con = openconnection
     cur = con.cursor()
@@ -317,13 +392,31 @@ def rangeinsert(ratingstablename, userid, itemid, rating, openconnection):
     """
     Function to insert a new row into the main table and specific partition based on range rating.
     Sử dụng truy vấn SQL để xác định phân mảnh và insert dữ liệu
+    
+    Parameters:
+    -----------
+    ratingstablename : str
+        Tên bảng ratings
+    userid : int
+        ID của user
+    itemid : int
+        ID của movie
+    rating : float
+        Giá trị rating
+    openconnection : psycopg2.extensions.connection
+        Kết nối đến database
+        
+    Notes:
+    -----
+    - Xác định bảng con dựa trên giá trị rating
+    - Insert vào bảng con tương ứng
     """
     con = openconnection
     cur = con.cursor()
     RANGE_TABLE_PREFIX = 'range_part'
     numberofpartitions = count_partitions(RANGE_TABLE_PREFIX, openconnection)
     delta = 5.0 / numberofpartitions
-
+    
     # Tạo truy vấn SQL để xác định phân mảnh và insert dữ liệu
     query = f"""
     DO $$
@@ -358,14 +451,23 @@ def create_db(dbname):
     """
     We create a DB by connecting to the default user and database of Postgres
     The function first checks if an existing database exists for a given name, else creates it.
-    :param dbname: Name of the database to create
-    :return: None
+    
+    Parameters:
+    -----------
+    dbname : str
+        Tên database cần tạo
+        
+    Notes:
+    -----
+    - Kết nối đến database mặc định
+    - Tạo database mới với tên được chỉ định
+    - Đóng kết nối
     """
     # Connect to the default database
     con = getopenconnection(dbname='postgres')
     con.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
     cur = con.cursor()
-
+    
     # Check if an existing database with the same name exists
     cur.execute('SELECT COUNT(*) FROM pg_catalog.pg_database WHERE datname=\'%s\'' % (dbname,))
     count = cur.fetchone()[0]
@@ -382,11 +484,28 @@ def create_db(dbname):
 def count_partitions(prefix, openconnection):
     """
     Function to count the number of tables which have the @prefix in their name somewhere.
+    
+    Parameters:
+    -----------
+    prefix : str
+        Prefix của tên bảng cần đếm
+    openconnection : psycopg2.extensions.connection
+        Kết nối đến database
+        
+    Returns:
+    --------
+    int
+        Số lượng bảng con có prefix được chỉ định
+        
+    Notes:
+    -----
+    - Truy vấn pg_stat_user_tables để đếm số bảng
+    - Chỉ đếm các bảng có tên bắt đầu bằng prefix
     """
     con = openconnection
     cur = con.cursor()
     cur.execute("select count(*) from pg_stat_user_tables where relname like " + "'" + prefix + "%';")
     count = cur.fetchone()[0]
     cur.close()
-
+    
     return count

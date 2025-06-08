@@ -15,7 +15,7 @@ def createdb(dbname):
     :return:None
     """
     # Connect to the default database
-    con = getopenconnection()
+    con = getopenconnection(dbname='postgres')
     con.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
     cur = con.cursor()
 
@@ -24,8 +24,9 @@ def createdb(dbname):
     count = cur.fetchone()[0]
     if count == 0:
         cur.execute('CREATE DATABASE %s' % (dbname,))  # Create the database
+        print('Đã tạo cơ sở dữ liệu mới: {0}'.format(dbname))
     else:
-        print('A database named "{0}" already exists'.format(dbname))
+        print('Cơ sở dữ liệu {0} đã tồn tại'.format(dbname))
 
     # Clean up
     cur.close()
@@ -251,22 +252,37 @@ def testroundrobinpartition(MyAssignment, ratingstablename, numberofpartitions, 
 
 def testroundrobininsert(MyAssignment, ratingstablename, userid, itemid, rating, openconnection, expectedtableindex):
     """
-    Tests the roundrobin insert function by checking whether the tuple is inserted in he Expected table you provide
+    Tests the round robin insert function
     :param ratingstablename: Argument for function to be tested
     :param userid: Argument for function to be tested
     :param itemid: Argument for function to be tested
     :param rating: Argument for function to be tested
     :param openconnection: Argument for function to be tested
-    :param expectedtableindex: The expected table to which the record has to be saved
+    :param expectedtableindex: This function assumes that you tables are named in an order. Eg: robinpart1, robinpart2...
     :return:Raises exception if any test fails
     """
     try:
-        expectedtablename = RROBIN_TABLE_PREFIX + expectedtableindex
-        MyAssignment.roundrobininsert(ratingstablename, userid, itemid, rating, openconnection)
-        if not testrangerobininsert(expectedtablename, itemid, openconnection, rating, userid):
-            raise Exception(
-                'Round robin insert failed! Couldnt find ({0}, {1}, {2}) tuple in {3} table'.format(userid, itemid, rating,
-                                                                                                    expectedtablename))
+        # Đếm số dòng trong bảng ratings trước khi insert
+        with openconnection.cursor() as cur:
+            cur.execute(f"SELECT COUNT(*) FROM {ratingstablename}")
+            total_rows_before = cur.fetchone()[0]
+            
+            # Tính toán số phân mảnh
+            cur.execute(f"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public' AND table_name LIKE '{RROBIN_TABLE_PREFIX}%'")
+            numberofpartitions = cur.fetchone()[0]
+            
+            # Tính toán phân mảnh cần kiểm tra
+            expected_partition_index = total_rows_before % numberofpartitions
+            expectedtablename = RROBIN_TABLE_PREFIX + str(expected_partition_index)
+            
+            # Thực hiện insert
+            MyAssignment.roundrobininsert(ratingstablename, userid, itemid, rating, openconnection)
+            
+            # Kiểm tra dữ liệu trong phân mảnh
+            if not testrangerobininsert(expectedtablename, itemid, openconnection, rating, userid):
+                raise Exception(
+                    'Round robin insert failed! Couldnt find ({0}, {1}, {2}) tuple in {3} table'.format(
+                        userid, itemid, rating, expectedtablename))
     except Exception as e:
         traceback.print_exc()
         return [False, e]

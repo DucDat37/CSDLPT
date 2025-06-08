@@ -1,0 +1,17 @@
+# Ignore ratings file
+ratings.dat
+*.dat
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDE
+.vscode/
+.idea/
+
+# Environment
+.env
+venv/
+env/ 

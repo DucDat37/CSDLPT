@@ -9,8 +9,8 @@ RROBIN_TABLE_PREFIX = 'rrobin_part'
 USER_ID_COLNAME = 'userid'
 MOVIE_ID_COLNAME = 'movieid'
 RATING_COLNAME = 'rating'
-INPUT_FILE_PATH = 'test_data.dat'
-ACTUAL_ROWS_IN_INPUT_FILE = 20  # Number of lines in the input file
+INPUT_FILE_PATH = 'ratings.dat'
+ACTUAL_ROWS_IN_INPUT_FILE = 10000054  # Number of lines in the input file
 
 import psycopg2
 import traceback
@@ -79,13 +79,7 @@ if __name__ == '__main__':
             else:
                 print("Hàm rangeinsert thất bại!")
 
-            # Chỉ xóa bảng ratings trước khi thực hiện round robin
-            with conn.cursor() as cur:
-                cur.execute(f"DROP TABLE IF EXISTS {RATINGS_TABLE}")
-            print("\nĐã xóa bảng ratings để chuẩn bị cho phân mảnh round robin")
-            
-            MyAssignment.loadratings(RATINGS_TABLE, INPUT_FILE_PATH, conn)
-
+            # Thực hiện roundrobin partition trực tiếp trên bảng ratings hiện tại
             [result, e] = testHelper.testroundrobinpartition(MyAssignment, RATINGS_TABLE, number_of_partitions, conn, 0, ACTUAL_ROWS_IN_INPUT_FILE)
             if result :
                 print("Hàm roundrobinpartition đã chạy thành công!")
@@ -94,7 +88,7 @@ if __name__ == '__main__':
 
             # Test roundrobininsert với partition index phù hợp
             partition_index = '0' if number_of_partitions == 1 else '1'
-            [result, e] = testHelper.testroundrobininsert(MyAssignment, RATINGS_TABLE, 100, 1, 3, conn, partition_index)
+            [result, e] = testHelper.testroundrobininsert(MyAssignment, RATINGS_TABLE, 9999999, 1, 3, conn, partition_index)
             if result :
                 print("Hàm roundrobininsert đã chạy thành công!")
             else:

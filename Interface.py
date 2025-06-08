@@ -81,7 +81,7 @@ def loadratings(ratingstablename, ratingsfilepath, openconnection):
     Exception
         - Nếu không thể mở file
         - Nếu file không đúng định dạng
-        - Nếu không thể insert dữ liệu vào database
+        - Nếu không thể load dữ liệu vào database
         
     Notes:
     -----
@@ -95,46 +95,78 @@ def loadratings(ratingstablename, ratingsfilepath, openconnection):
     - Hàm sử dụng COPY để load dữ liệu nhanh hơn so với INSERT
     """
     try:
-        # Tạo cursor để thực thi các câu lệnh SQL
         cur = openconnection.cursor()
         
-        # Tạo bảng ratings nếu chưa tồn tại
+        # Tạo bảng ratings với cấu trúc tối ưu
         create_table_query = f"""
         CREATE TABLE IF NOT EXISTS {ratingstablename} (
             {USER_ID_COLNAME} INTEGER,
             {MOVIE_ID_COLNAME} INTEGER,
-            {RATING_COLNAME} FLOAT,
-            PRIMARY KEY ({USER_ID_COLNAME}, {MOVIE_ID_COLNAME})
+            {RATING_COLNAME} FLOAT
+        ) WITH (
+            autovacuum_enabled = false,
+            fillfactor = 100
         )
         """
         cur.execute(create_table_query)
         
-        # Mở file dữ liệu
+        # Tắt các ràng buộc và trigger
+        cur.execute(f"ALTER TABLE {ratingstablename} DISABLE TRIGGER ALL")
+        
+        # Xóa index cũ nếu có
+        cur.execute(f"DROP INDEX IF EXISTS idx_{ratingstablename}_rating")
+        cur.execute(f"DROP INDEX IF EXISTS idx_{ratingstablename}_userid")
+        cur.execute(f"DROP INDEX IF EXISTS idx_{ratingstablename}_movieid")
+        
+        # Sử dụng COPY trực tiếp vào bảng chính
         with open(ratingsfilepath, 'r') as ratingsfile:
-            # Đọc từng dòng trong file
-            for line in ratingsfile:
-                # Tách các trường dữ liệu theo dấu ::
-                userid, movieid, rating, timestamp = line.strip().split('::')
-                
-                # Insert dữ liệu vào bảng ratings
-                insert_query = f"""
-                INSERT INTO {ratingstablename} ({USER_ID_COLNAME}, {MOVIE_ID_COLNAME}, {RATING_COLNAME})
-                VALUES (%s, %s, %s)
-                ON CONFLICT ({USER_ID_COLNAME}, {MOVIE_ID_COLNAME}) DO NOTHING
-                """
-                cur.execute(insert_query, (int(userid), int(movieid), float(rating)))
+            # Tạo bảng tạm với cấu trúc phù hợp cho COPY
+            cur.execute(f"""
+            CREATE TEMP TABLE temp_ratings (
+                {USER_ID_COLNAME} INTEGER,
+                extra1 CHAR,
+                {MOVIE_ID_COLNAME} INTEGER,
+                extra2 CHAR,
+                {RATING_COLNAME} FLOAT,
+                extra3 CHAR,
+                timestamp BIGINT
+            ) ON COMMIT DROP
+            """)
+            
+            # COPY dữ liệu vào bảng tạm
+            cur.copy_from(ratingsfile, 'temp_ratings', sep=':')
+            
+            # Insert dữ liệu từ bảng tạm vào bảng chính với batch size lớn
+            cur.execute(f"""
+            INSERT INTO {ratingstablename} ({USER_ID_COLNAME}, {MOVIE_ID_COLNAME}, {RATING_COLNAME})
+            SELECT {USER_ID_COLNAME}, {MOVIE_ID_COLNAME}, {RATING_COLNAME}
+            FROM temp_ratings
+            """)
+        
+        # Tạo index sau khi load dữ liệu
+        cur.execute(f"CREATE INDEX idx_{ratingstablename}_rating ON {ratingstablename} ({RATING_COLNAME})")
+        cur.execute(f"CREATE INDEX idx_{ratingstablename}_userid ON {ratingstablename} ({USER_ID_COLNAME})")
+        cur.execute(f"CREATE INDEX idx_{ratingstablename}_movieid ON {ratingstablename} ({MOVIE_ID_COLNAME})")
+        
+        # Thêm primary key sau khi load dữ liệu
+        cur.execute(f"""
+        ALTER TABLE {ratingstablename} 
+        ADD CONSTRAINT pk_{ratingstablename} 
+        PRIMARY KEY ({USER_ID_COLNAME}, {MOVIE_ID_COLNAME})
+        """)
+        
+        # Bật lại các ràng buộc và trigger
+        cur.execute(f"ALTER TABLE {ratingstablename} ENABLE TRIGGER ALL")
         
         # Commit các thay đổi vào database
         openconnection.commit()
         
     except Exception as e:
-        # Rollback nếu có lỗi xảy ra
         openconnection.rollback()
         print("Error: Could not load ratings from file")
         print(e)
         raise e
     finally:
-        # Đóng cursor
         cur.close()
 
 def rangepartition(ratingstablename, numberofpartitions, openconnection):

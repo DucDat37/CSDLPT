@@ -116,77 +116,61 @@ def loadratings(ratingstablename, ratingsfilepath, openconnection):
 
 def rangepartition(ratingstablename, numberofpartitions, openconnection):
     """
-    Function to create partitions of main table based on range of ratings.
-    Sử dụng truy vấn SQL để phân mảnh dựa trên khoảng giá trị của rating
-    
-    Thuật toán phân vùng theo khoảng giá trị:
-    1. Tính toán khoảng giá trị cho mỗi phân vùng:
-       - Khoảng giá trị rating là từ 0 đến 5.0
-       - Chia đều khoảng này thành numberofpartitions phần
-       - Delta = 5.0/numberofpartitions là độ rộng của mỗi khoảng
-    
-    2. Tạo các bảng con:
-       - Mỗi bảng con có prefix 'range_part'
-       - Cấu trúc bảng: userid, movieid, rating
-       - Tên bảng: range_part0, range_part1, ...
-    
-    3. Phân phối dữ liệu:
-       - Phân vùng 0: [0, delta] - chứa các rating từ 0 đến delta
-       - Phân vùng 1: (delta, 2*delta] - chứa các rating từ delta đến 2*delta
-       - Phân vùng 2: (2*delta, 3*delta] - chứa các rating từ 2*delta đến 3*delta
-       - ...
-       - Phân vùng cuối: ((n-1)*delta, 5.0] - chứa các rating từ (n-1)*delta đến 5.0
-    
-    4. Ưu điểm:
-       - Phân phối dữ liệu đều theo giá trị rating
-       - Dễ dàng tìm kiếm theo khoảng giá trị
-       - Hiệu quả cho các truy vấn có điều kiện trên rating
-    
-    5. Nhược điểm:
-       - Có thể dẫn đến phân phối không đều nếu dữ liệu tập trung ở một khoảng
-       - Cần tính toán lại khi thêm/xóa phân vùng
+    Function to partition the ratings table into numberofpartitions partitions based on ranges of ratings.
+    Optimized for speed.
     """
     try:
         start_time = time.time()
         
-        con = openconnection
-        cur = con.cursor()
+        cur = openconnection.cursor()
+        
+        # Tắt các tính năng không cần thiết để tăng tốc
+        cur.execute("SET session_replication_role = 'replica'")  # Tắt triggers
+        cur.execute("SET synchronous_commit = OFF")  # Tắt synchronous commit
         
         # Tính khoảng giá trị cho mỗi phân mảnh
         delta = 5.0 / numberofpartitions
         
-        # Tạo các bảng phân mảnh
+        # Tạo các bảng phân mảnh với UNLOGGED để tăng tốc
         for i in range(numberofpartitions):
             min_range = i * delta
             max_range = min_range + delta
             table_name = RANGE_TABLE_PREFIX + str(i)
             
-            # Tạo bảng phân mảnh
+            # Tạo bảng UNLOGGED để tăng tốc độ insert
             cur.execute(f"""
-                CREATE TABLE {table_name} (
-                    userid INTEGER,
-                    movieid INTEGER,
-                    rating FLOAT
-                )
+            CREATE UNLOGGED TABLE {table_name} (
+                userid INTEGER,
+                movieid INTEGER,
+                rating FLOAT,
+                PRIMARY KEY (userid, movieid)
+            ) WITH (
+                autovacuum_enabled = false
+            )
             """)
             
-            # Chèn dữ liệu vào bảng phân mảnh dựa trên khoảng giá trị
+            # Insert dữ liệu với điều kiện đơn giản
             if i == 0:
-                # Phân mảnh đầu tiên: [min_range, max_range]
                 cur.execute(f"""
-                    INSERT INTO {table_name} (userid, movieid, rating)
-                    SELECT userid, movieid, rating
-                    FROM {ratingstablename}
-                    WHERE rating >= {min_range} AND rating <= {max_range}
+                INSERT INTO {table_name} (userid, movieid, rating)
+                SELECT userid, movieid, rating
+                FROM {ratingstablename}
+                WHERE rating <= {max_range}
                 """)
             else:
-                # Các phân mảnh còn lại: (min_range, max_range]
                 cur.execute(f"""
-                    INSERT INTO {table_name} (userid, movieid, rating)
-                    SELECT userid, movieid, rating
-                    FROM {ratingstablename}
-                    WHERE rating > {min_range} AND rating <= {max_range}
+                INSERT INTO {table_name} (userid, movieid, rating)
+                SELECT userid, movieid, rating
+                FROM {ratingstablename}
+                WHERE rating > {min_range} AND rating <= {max_range}
                 """)
+            
+            # Commit sau mỗi phân vùng để tránh transaction quá lớn
+            openconnection.commit()
+        
+        # Bật lại các tính năng
+        cur.execute("SET session_replication_role = 'origin'")
+        cur.execute("SET synchronous_commit = ON")
         
         # Commit và đóng cursor
         openconnection.commit()
@@ -202,6 +186,15 @@ def rangepartition(ratingstablename, numberofpartitions, openconnection):
         print("Error: Could not create range partitions")
         print(e)
         raise e
+    finally:
+        # Đảm bảo các cài đặt được reset về mặc định
+        try:
+            cur = openconnection.cursor()
+            cur.execute("SET session_replication_role = 'origin'")
+            cur.execute("SET synchronous_commit = ON")
+            cur.close()
+        except:
+            pass
 
 def roundrobinpartition(ratingstablename, numberofpartitions, openconnection):
     """

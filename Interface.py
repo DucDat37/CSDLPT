@@ -4,6 +4,7 @@
 #
 
 import psycopg2
+import time
 
 # Các hằng số định nghĩa prefix và tên cột
 RANGE_TABLE_PREFIX = 'range_part'  # Prefix cho tên bảng phân vùng theo khoảng giá trị
@@ -60,114 +61,58 @@ def getopenconnection(dbname='postgres'):
 
 def loadratings(ratingstablename, ratingsfilepath, openconnection):
     """
-    Hàm đọc dữ liệu từ file và load vào bảng ratings trong database
-    
-    Parameters:
-    -----------
-    ratingstablename : str
-        Tên bảng ratings trong database
-    ratingsfilepath : str
-        Đường dẫn đến file chứa dữ liệu ratings
-    openconnection : psycopg2.extensions.connection
-        Kết nối đến database
-        
-    Returns:
-    --------
-    None
-    
-    Raises:
-    -------
-    Exception
-        - Nếu không thể mở file
-        - Nếu file không đúng định dạng
-        - Nếu không thể load dữ liệu vào database
-        
-    Notes:
-    -----
-    - File dữ liệu phải có định dạng: userid::movieid::rating::timestamp
-    - Mỗi dòng trong file là một bản ghi ratings
-    - Hàm sẽ tạo bảng ratings nếu chưa tồn tại
-    - Bảng ratings có cấu trúc:
-        + userid: integer (khóa chính)
-        + movieid: integer (khóa chính)
-        + rating: float
-    - Hàm sử dụng COPY để load dữ liệu nhanh hơn so với INSERT
+    Function to load data in @ratingsfilepath file to a table called @ratingstablename.
     """
     try:
-        # Tạo cursor để thực thi các câu lệnh SQL
+        start_time = time.time()
+        
+        # Tạo bảng với cấu trúc phù hợp cho file input
         cur = openconnection.cursor()
-        
-        # Tạo bảng ratings với cấu trúc tối ưu
-        create_table_query = f"""
-        CREATE TABLE IF NOT EXISTS {ratingstablename} (
-            {USER_ID_COLNAME} INTEGER,
-            {MOVIE_ID_COLNAME} INTEGER,
-            {RATING_COLNAME} FLOAT
-        ) WITH (
-            autovacuum_enabled = false,
-            fillfactor = 100
-        )
-        """
-        cur.execute(create_table_query)
-        
-        # Tắt các ràng buộc và trigger
-        cur.execute(f"ALTER TABLE {ratingstablename} DISABLE TRIGGER ALL")
-        
-        # Xóa index cũ nếu có
-        cur.execute(f"DROP INDEX IF EXISTS idx_{ratingstablename}_rating")
-        cur.execute(f"DROP INDEX IF EXISTS idx_{ratingstablename}_userid")
-        cur.execute(f"DROP INDEX IF EXISTS idx_{ratingstablename}_movieid")
-        
-        # Sử dụng COPY trực tiếp vào bảng chính
-        with open(ratingsfilepath, 'r') as ratingsfile:
-            # Tạo bảng tạm với cấu trúc phù hợp cho COPY
-            cur.execute(f"""
-            CREATE TEMP TABLE temp_ratings (
-                {USER_ID_COLNAME} INTEGER,
-                extra1 CHAR,
-                {MOVIE_ID_COLNAME} INTEGER,
-                extra2 CHAR,
-                {RATING_COLNAME} FLOAT,
-                extra3 CHAR,
-                timestamp BIGINT
-            ) ON COMMIT DROP
-            """)
-            
-            # COPY dữ liệu vào bảng tạm
-            cur.copy_from(ratingsfile, 'temp_ratings', sep=':')
-            
-            # Insert dữ liệu từ bảng tạm vào bảng chính với batch size lớn
-            cur.execute(f"""
-            INSERT INTO {ratingstablename} ({USER_ID_COLNAME}, {MOVIE_ID_COLNAME}, {RATING_COLNAME})
-            SELECT {USER_ID_COLNAME}, {MOVIE_ID_COLNAME}, {RATING_COLNAME}
-            FROM temp_ratings
-            """)
-        
-        # Tạo index sau khi load dữ liệu
-        cur.execute(f"CREATE INDEX idx_{ratingstablename}_rating ON {ratingstablename} ({RATING_COLNAME})")
-        cur.execute(f"CREATE INDEX idx_{ratingstablename}_userid ON {ratingstablename} ({USER_ID_COLNAME})")
-        cur.execute(f"CREATE INDEX idx_{ratingstablename}_movieid ON {ratingstablename} ({MOVIE_ID_COLNAME})")
-        
-        # Thêm primary key sau khi load dữ liệu
         cur.execute(f"""
-        ALTER TABLE {ratingstablename} 
-        ADD CONSTRAINT pk_{ratingstablename} 
-        PRIMARY KEY ({USER_ID_COLNAME}, {MOVIE_ID_COLNAME})
+        CREATE TABLE {ratingstablename} (
+            {USER_ID_COLNAME} INTEGER,
+            extra1 CHAR,
+            {MOVIE_ID_COLNAME} INTEGER,
+            extra2 CHAR,
+            {RATING_COLNAME} FLOAT,
+            extra3 CHAR,
+            timestamp BIGINT
+        )
         """)
         
-        # Bật lại các ràng buộc và trigger
-        cur.execute(f"ALTER TABLE {ratingstablename} ENABLE TRIGGER ALL")
+        # Copy trực tiếp từ file vào bảng
+        with open(ratingsfilepath, 'r') as f:
+            cur.copy_from(f, ratingstablename, sep=':')
         
-        # Commit các thay đổi vào database
+        # Xóa các cột không cần thiết
+        cur.execute(f"""
+        ALTER TABLE {ratingstablename} 
+        DROP COLUMN extra1,
+        DROP COLUMN extra2,
+        DROP COLUMN extra3,
+        DROP COLUMN timestamp
+        """)
+        
+        # Thêm primary key
+        cur.execute(f"""
+        ALTER TABLE {ratingstablename} 
+        ADD PRIMARY KEY ({USER_ID_COLNAME}, {MOVIE_ID_COLNAME})
+        """)
+        
+        # Commit và đóng cursor
         openconnection.commit()
+        cur.close()
+        
+        # Tính và in thời gian thực thi
+        end_time = time.time()
+        execution_time = end_time - start_time
+        print(f"Thời gian thực thi hàm loadratings: {execution_time:.2f} giây")
         
     except Exception as e:
         openconnection.rollback()
         print("Error: Could not load ratings from file")
         print(e)
         raise e
-    finally:
-        cur.close()
 
 def rangepartition(ratingstablename, numberofpartitions, openconnection):
     """
@@ -201,47 +146,62 @@ def rangepartition(ratingstablename, numberofpartitions, openconnection):
        - Có thể dẫn đến phân phối không đều nếu dữ liệu tập trung ở một khoảng
        - Cần tính toán lại khi thêm/xóa phân vùng
     """
-    con = openconnection
-    cur = con.cursor()
-    
-    # Tính khoảng giá trị cho mỗi phân mảnh
-    delta = 5.0 / numberofpartitions
-    
-    # Tạo các bảng phân mảnh
-    for i in range(numberofpartitions):
-        min_range = i * delta
-        max_range = min_range + delta
-        table_name = RANGE_TABLE_PREFIX + str(i)
+    try:
+        start_time = time.time()
         
-        # Tạo bảng phân mảnh
-        cur.execute(f"""
-            CREATE TABLE {table_name} (
-                userid INTEGER,
-                movieid INTEGER,
-                rating FLOAT
-            )
-        """)
+        con = openconnection
+        cur = con.cursor()
         
-        # Chèn dữ liệu vào bảng phân mảnh dựa trên khoảng giá trị
-        if i == 0:
-            # Phân mảnh đầu tiên: [min_range, max_range]
+        # Tính khoảng giá trị cho mỗi phân mảnh
+        delta = 5.0 / numberofpartitions
+        
+        # Tạo các bảng phân mảnh
+        for i in range(numberofpartitions):
+            min_range = i * delta
+            max_range = min_range + delta
+            table_name = RANGE_TABLE_PREFIX + str(i)
+            
+            # Tạo bảng phân mảnh
             cur.execute(f"""
-                INSERT INTO {table_name} (userid, movieid, rating)
-                SELECT userid, movieid, rating
-                FROM {ratingstablename}
-                WHERE rating >= {min_range} AND rating <= {max_range}
+                CREATE TABLE {table_name} (
+                    userid INTEGER,
+                    movieid INTEGER,
+                    rating FLOAT
+                )
             """)
-        else:
-            # Các phân mảnh còn lại: (min_range, max_range]
-            cur.execute(f"""
-                INSERT INTO {table_name} (userid, movieid, rating)
-                SELECT userid, movieid, rating
-                FROM {ratingstablename}
-                WHERE rating > {min_range} AND rating <= {max_range}
-            """)
-    
-    cur.close()
-    con.commit()
+            
+            # Chèn dữ liệu vào bảng phân mảnh dựa trên khoảng giá trị
+            if i == 0:
+                # Phân mảnh đầu tiên: [min_range, max_range]
+                cur.execute(f"""
+                    INSERT INTO {table_name} (userid, movieid, rating)
+                    SELECT userid, movieid, rating
+                    FROM {ratingstablename}
+                    WHERE rating >= {min_range} AND rating <= {max_range}
+                """)
+            else:
+                # Các phân mảnh còn lại: (min_range, max_range]
+                cur.execute(f"""
+                    INSERT INTO {table_name} (userid, movieid, rating)
+                    SELECT userid, movieid, rating
+                    FROM {ratingstablename}
+                    WHERE rating > {min_range} AND rating <= {max_range}
+                """)
+        
+        # Commit và đóng cursor
+        openconnection.commit()
+        cur.close()
+        
+        # Tính và in thời gian thực thi
+        end_time = time.time()
+        execution_time = end_time - start_time
+        print(f"Thời gian thực thi hàm rangepartition: {execution_time:.2f} giây")
+        
+    except Exception as e:
+        openconnection.rollback()
+        print("Error: Could not create range partitions")
+        print(e)
+        raise e
 
 def roundrobinpartition(ratingstablename, numberofpartitions, openconnection):
     """
@@ -277,49 +237,65 @@ def roundrobinpartition(ratingstablename, numberofpartitions, openconnection):
        - Cần quét tất cả các bảng con khi tìm kiếm theo giá trị
        - Khó khăn trong việc tìm kiếm theo khoảng giá trị
     """
-    con = openconnection
-    cur = con.cursor()
-    RROBIN_TABLE_PREFIX = 'rrobin_part'
-
-    # Tạo các bảng phân mảnh
-    for i in range(numberofpartitions):
-        table_name = RROBIN_TABLE_PREFIX + str(i)
-        cur.execute(f"""
-            CREATE TABLE {table_name} (
-                userid INTEGER,
-                movieid INTEGER,
-                rating FLOAT
-            )
-        """)
+    try:
+        start_time = time.time()
         
-    # Phân phối dữ liệu theo round robin
-    query = f"""
-    DO $$
-    DECLARE
-        target_partition text;
-        row_data record;
-    BEGIN
-        FOR row_data IN 
-            SELECT 
-                userid,
-                movieid,
-                rating,
-                ROW_NUMBER() OVER (ORDER BY userid, movieid) - 1 as row_num
-            FROM {ratingstablename}
-        LOOP
-            -- Tính toán tên bảng phân mảnh
-            target_partition := '{RROBIN_TABLE_PREFIX}' || (row_data.row_num % {numberofpartitions})::text;
-            
-            -- Insert dữ liệu vào phân mảnh tương ứng
-            EXECUTE format('INSERT INTO %I (userid, movieid, rating) VALUES ($1, $2, $3)', target_partition)
-            USING row_data.userid, row_data.movieid, row_data.rating;
-        END LOOP;
-    END $$;
-    """
-    
-    cur.execute(query)
-    cur.close()
-    con.commit()
+        con = openconnection
+        cur = con.cursor()
+        RROBIN_TABLE_PREFIX = 'rrobin_part'
+
+        # Tạo các bảng phân mảnh
+        for i in range(numberofpartitions):
+            table_name = RROBIN_TABLE_PREFIX + str(i)
+            cur.execute(f"""
+                CREATE TABLE {table_name} (
+                    userid INTEGER,
+                    movieid INTEGER,
+                    rating FLOAT
+                )
+            """)
+        
+        # Phân phối dữ liệu theo round robin
+        query = f"""
+        DO $$
+        DECLARE
+            target_partition text;
+            row_data record;
+        BEGIN
+            FOR row_data IN 
+                SELECT 
+                    userid,
+                    movieid,
+                    rating,
+                    ROW_NUMBER() OVER (ORDER BY userid, movieid) - 1 as row_num
+                FROM {ratingstablename}
+            LOOP
+                -- Tính toán tên bảng phân mảnh
+                target_partition := '{RROBIN_TABLE_PREFIX}' || (row_data.row_num % {numberofpartitions})::text;
+                
+                -- Insert dữ liệu vào phân mảnh tương ứng
+                EXECUTE format('INSERT INTO %I (userid, movieid, rating) VALUES ($1, $2, $3)', target_partition)
+                USING row_data.userid, row_data.movieid, row_data.rating;
+            END LOOP;
+        END $$;
+        """
+        
+        cur.execute(query)
+        
+        # Commit và đóng cursor
+        openconnection.commit()
+        cur.close()
+        
+        # Tính và in thời gian thực thi
+        end_time = time.time()
+        execution_time = end_time - start_time
+        print(f"Thời gian thực thi hàm roundrobinpartition: {execution_time:.2f} giây")
+        
+    except Exception as e:
+        openconnection.rollback()
+        print("Error: Could not create round robin partitions")
+        print(e)
+        raise e
 
 def roundrobininsert(ratingstablename, userid, itemid, rating, openconnection):
     """

@@ -61,8 +61,47 @@ def getopenconnection(dbname='postgres'):
 
 def loadratings(ratingstablename, ratingsfilepath, openconnection):
     """
-    Function to load data in @ratingsfilepath file to a table called @ratingstablename.
+    Hàm tải dữ liệu ratings từ file vào database PostgreSQL.
+    
+    Hàm này thực hiện các bước sau:
+    1. Tạo bảng tạm thời với cấu trúc đầy đủ để phù hợp với định dạng file input
+    2. Copy dữ liệu trực tiếp từ file vào bảng sử dụng psycopg2.copy_from
+    3. Dọn dẹp bảng bằng cách xóa các cột phụ không cần thiết
+    4. Thêm primary key composite cho cặp (userid, movieid)
+    
+    Parameters:
+    -----------
+    ratingstablename : str
+        Tên bảng sẽ được tạo để lưu trữ dữ liệu ratings
+    ratingsfilepath : str
+        Đường dẫn đến file chứa dữ liệu ratings
+        File input phải có định dạng: userid:extra1:movieid:extra2:rating:extra3:timestamp
+        với dấu ':' làm separator
+    openconnection : psycopg2.extensions.connection
+        Kết nối đến database PostgreSQL
+        
+    Returns:
+    --------
+    None
+    
+    Raises:
+    -------
+    Exception
+        - Nếu không thể tạo bảng
+        - Nếu không thể đọc file
+        - Nếu không thể copy dữ liệu
+        - Nếu không thể thêm primary key
+        
+    Notes:
+    -----
+    - File input phải có định dạng cố định với 7 cột phân cách bằng dấu ':'
+    - Các cột phụ (extra1, extra2, extra3, timestamp) sẽ bị xóa sau khi import
+    - Bảng kết quả chỉ chứa 3 cột: userid, movieid, rating
+    - Primary key được đặt trên cặp (userid, movieid) để đảm bảo tính duy nhất
+    - Hàm sử dụng transaction để đảm bảo tính toàn vẹn dữ liệu
+    - Nếu có lỗi xảy ra, toàn bộ transaction sẽ được rollback
     """
+   
     try:
         start_time = time.time()
         
@@ -116,130 +155,202 @@ def loadratings(ratingstablename, ratingsfilepath, openconnection):
 
 def rangepartition(ratingstablename, numberofpartitions, openconnection):
     """
-    Function to partition the ratings table into numberofpartitions partitions based on ranges of ratings.
-    Optimized for speed.
+    Hàm phân vùng dữ liệu ratings theo khoảng giá trị (range partitioning).
+    
+    Hàm này thực hiện phân vùng dữ liệu ratings thành các bảng nhỏ hơn dựa trên giá trị rating,
+    với mỗi phân vùng chứa các bản ghi có rating nằm trong một khoảng giá trị cụ thể.
+    
+    Cách phân vùng:
+    - Khoảng giá trị rating tổng thể là [0, 5]
+    - Khoảng giá trị được chia đều thành numberofpartitions phần
+    - Phân vùng đầu tiên bao gồm cả giá trị min: [min_range, max_range]
+    - Các phân vùng còn lại không bao gồm giá trị min: (min_range, max_range]
+    
+    Ví dụ với numberofpartitions = 5:
+    - range_part0: ratings từ 0.0 đến 1.0
+    - range_part1: ratings từ 1.0 đến 2.0
+    - range_part2: ratings từ 2.0 đến 3.0
+    - range_part3: ratings từ 3.0 đến 4.0
+    - range_part4: ratings từ 4.0 đến 5.0
+    
+    Parameters:
+    -----------
+    ratingstablename : str
+        Tên bảng chứa dữ liệu ratings gốc cần được phân vùng
+    numberofpartitions : int
+        Số lượng phân vùng cần tạo
+        Lưu ý: số này phải > 0 và nên được chọn phù hợp với phân phối dữ liệu
+    openconnection : psycopg2.extensions.connection
+        Kết nối đến database PostgreSQL
+        
+    Returns:
+    --------
+    None
+    
+    Raises:
+    -------
+    Exception
+        - Nếu không thể tạo các bảng phân vùng
+        - Nếu không thể chèn dữ liệu vào các phân vùng
+        - Nếu numberofpartitions <= 0
+        - Nếu bảng ratingstablename không tồn tại
+        
+    Notes:
+    -----
+    - Mỗi phân vùng được tạo thành một bảng riêng biệt với tên format: range_part{index}
+    - Cấu trúc mỗi bảng phân vùng giống nhau: (userid, movieid, rating)
+    - Phân vùng theo range giúp tối ưu hiệu suất truy vấn khi cần lấy dữ liệu trong một khoảng rating cụ thể
+    - Hàm sử dụng transaction để đảm bảo tính toàn vẹn dữ liệu
+    - Nếu có lỗi xảy ra, toàn bộ transaction sẽ được rollback
+    - Thời gian thực thi của hàm được tính và in ra
     """
+   
     try:
+        # Bắt đầu tính thời gian thực thi
         start_time = time.time()
         
-        cur = openconnection.cursor()
+        con = openconnection
+        cur = con.cursor()
         
-        # Tắt các tính năng không cần thiết để tăng tốc
-        cur.execute("SET session_replication_role = 'replica'")  # Tắt triggers
-        cur.execute("SET synchronous_commit = OFF")  # Tắt synchronous commit
-        
-        # Tính khoảng giá trị cho mỗi phân mảnh
+        # Bước 1: Tính toán khoảng giá trị cho mỗi phân vùng
+        # Ví dụ: nếu numberofpartitions = 5, delta = 1.0
+        # Tạo ra các khoảng: [0,1], (1,2], (2,3], (3,4], (4,5]
         delta = 5.0 / numberofpartitions
         
-        # Tạo các bảng phân mảnh với UNLOGGED để tăng tốc
+        # Bước 2: Tạo và phân phối dữ liệu cho từng phân vùng
         for i in range(numberofpartitions):
-            min_range = i * delta
-            max_range = min_range + delta
-            table_name = RANGE_TABLE_PREFIX + str(i)
+            # Tính toán ranh giới của phân vùng hiện tại
+            min_range = i * delta  # Giá trị nhỏ nhất của phân vùng
+            max_range = min_range + delta  # Giá trị lớn nhất của phân vùng
+            table_name = RANGE_TABLE_PREFIX + str(i)  # Tên bảng phân vùng: range_part0, range_part1,...
             
-            # Tạo bảng UNLOGGED để tăng tốc độ insert
+            # Bước 2.1: Tạo bảng phân vùng với cấu trúc cố định
+            # Mỗi bảng có 3 cột: userid, movieid, rating
             cur.execute(f"""
-            CREATE UNLOGGED TABLE {table_name} (
-                userid INTEGER,
-                movieid INTEGER,
-                rating FLOAT,
-                PRIMARY KEY (userid, movieid)
-            ) WITH (
-                autovacuum_enabled = false
-            )
+                CREATE TABLE {table_name} (
+                    userid INTEGER,
+                    movieid INTEGER,
+                    rating FLOAT
+                )
             """)
             
-            # Insert dữ liệu với điều kiện đơn giản
+            # Bước 2.2: Phân phối dữ liệu vào phân vùng dựa trên giá trị rating
             if i == 0:
+                # Phân vùng đầu tiên (i=0):
+                # - Bao gồm cả giá trị min_range
+                # - Ví dụ: [0.0, 1.0] nếu delta = 1.0
                 cur.execute(f"""
-                INSERT INTO {table_name} (userid, movieid, rating)
-                SELECT userid, movieid, rating
-                FROM {ratingstablename}
-                WHERE rating <= {max_range}
+                    INSERT INTO {table_name} (userid, movieid, rating)
+                    SELECT userid, movieid, rating
+                    FROM {ratingstablename}
+                    WHERE rating >= {min_range} AND rating <= {max_range}
                 """)
             else:
+                # Các phân vùng còn lại (i > 0):
+                # - Không bao gồm giá trị min_range
+                # - Ví dụ: (1.0, 2.0], (2.0, 3.0],...
                 cur.execute(f"""
-                INSERT INTO {table_name} (userid, movieid, rating)
-                SELECT userid, movieid, rating
-                FROM {ratingstablename}
-                WHERE rating > {min_range} AND rating <= {max_range}
+                    INSERT INTO {table_name} (userid, movieid, rating)
+                    SELECT userid, movieid, rating
+                    FROM {ratingstablename}
+                    WHERE rating > {min_range} AND rating <= {max_range}
                 """)
-            
-            # Commit sau mỗi phân vùng để tránh transaction quá lớn
-            openconnection.commit()
         
-        # Bật lại các tính năng
-        cur.execute("SET session_replication_role = 'origin'")
-        cur.execute("SET synchronous_commit = ON")
-        
-        # Commit và đóng cursor
+        # Bước 3: Hoàn tất transaction
+        # Commit các thay đổi vào database
         openconnection.commit()
         cur.close()
         
-        # Tính và in thời gian thực thi
+        # Bước 4: Tính và in thời gian thực thi
         end_time = time.time()
         execution_time = end_time - start_time
         print(f"Thời gian thực thi hàm rangepartition: {execution_time:.2f} giây")
         
     except Exception as e:
+        # Bước 5: Xử lý lỗi
+        # Nếu có bất kỳ lỗi nào xảy ra trong quá trình thực thi:
+        # 1. Rollback toàn bộ transaction để đảm bảo tính toàn vẹn dữ liệu
+        # 2. In thông báo lỗi
+        # 3. Ném ngoại lệ để thông báo cho người gọi hàm
         openconnection.rollback()
         print("Error: Could not create range partitions")
         print(e)
         raise e
-    finally:
-        # Đảm bảo các cài đặt được reset về mặc định
-        try:
-            cur = openconnection.cursor()
-            cur.execute("SET session_replication_role = 'origin'")
-            cur.execute("SET synchronous_commit = ON")
-            cur.close()
-        except:
-            pass
 
 def roundrobinpartition(ratingstablename, numberofpartitions, openconnection):
     """
-    Function to create partitions of main table using round robin approach.
-    Sử dụng truy vấn SQL để phân mảnh dữ liệu theo round robin
+    Hàm phân vùng dữ liệu ratings theo phương pháp Round Robin.
     
-    Thuật toán phân vùng theo round-robin:
-    1. Nguyên lý hoạt động:
-       - Phân phối dữ liệu luân phiên vào các bảng con
-       - Mỗi bản ghi được gán một số thứ tự (row_num)
-       - Bảng con được chọn dựa trên phép chia lấy dư: row_num % numberofpartitions
+    Hàm này thực hiện phân vùng dữ liệu ratings thành các bảng nhỏ hơn bằng cách phân phối
+    các bản ghi luân phiên (round robin) vào các phân vùng. Mỗi bản ghi sẽ được gán vào
+    một phân vùng theo thứ tự tuần tự, và sau khi gán đến phân vùng cuối cùng, quá trình
+    sẽ quay lại phân vùng đầu tiên.
     
-    2. Tạo các bảng con:
-       - Mỗi bảng con có prefix 'rrobin_part'
-       - Cấu trúc bảng: userid, movieid, rating
-       - Tên bảng: rrobin_part0, rrobin_part1, ...
+    Cách phân vùng:
+    - Dữ liệu được đọc tuần tự từ bảng gốc
+    - Mỗi bản ghi được gán một số thứ tự (row_num) bắt đầu từ 0
+    - Phân vùng được chọn dựa trên công thức: row_num % numberofpartitions
+    - Điều này đảm bảo dữ liệu được phân phối đều giữa các phân vùng
     
-    3. Phân phối dữ liệu:
-       - Bản ghi 0 -> rrobin_part0
-       - Bản ghi 1 -> rrobin_part1
-       - Bản ghi 2 -> rrobin_part2
-       - ...
-       - Bản ghi n -> rrobin_part(n % numberofpartitions)
+    Ví dụ với numberofpartitions = 3:
+    - Bản ghi 0 -> range_part0 (0 % 3 = 0)
+    - Bản ghi 1 -> range_part1 (1 % 3 = 1)
+    - Bản ghi 2 -> range_part2 (2 % 3 = 2)
+    - Bản ghi 3 -> range_part0 (3 % 3 = 0)
+    - Bản ghi 4 -> range_part1 (4 % 3 = 1)
+    - và cứ tiếp tục như vậy...
     
-    4. Ưu điểm:
-       - Phân phối dữ liệu đều giữa các bảng con
-       - Không phụ thuộc vào giá trị của dữ liệu
-       - Dễ dàng thêm/xóa phân vùng
-       - Hiệu quả cho các truy vấn song song
+    Parameters:
+    -----------
+    ratingstablename : str
+        Tên bảng chứa dữ liệu ratings gốc cần được phân vùng
+    numberofpartitions : int
+        Số lượng phân vùng cần tạo
+        Lưu ý: số này phải > 0 và nên được chọn để đảm bảo kích thước phân vùng phù hợp
+    openconnection : psycopg2.extensions.connection
+        Kết nối đến database PostgreSQL
+        
+    Returns:
+    --------
+    None
     
-    5. Nhược điểm:
-       - Không tối ưu cho các truy vấn có điều kiện trên rating
-       - Cần quét tất cả các bảng con khi tìm kiếm theo giá trị
-       - Khó khăn trong việc tìm kiếm theo khoảng giá trị
+    Raises:
+    -------
+    Exception
+        - Nếu không thể tạo các bảng phân vùng
+        - Nếu không thể chèn dữ liệu vào các phân vùng
+        - Nếu numberofpartitions <= 0
+        - Nếu bảng ratingstablename không tồn tại
+        
+    Notes:
+    -----
+    - Mỗi phân vùng được tạo thành một bảng riêng biệt với tên format: rrobin_part{index}
+    - Cấu trúc mỗi bảng phân vùng giống nhau: (userid, movieid, rating)
+    - Phân vùng Round Robin đảm bảo dữ liệu được phân phối đều giữa các phân vùng
+    - Phương pháp này phù hợp khi:
+        + Cần cân bằng tải giữa các phân vùng
+        + Không có yêu cầu cụ thể về việc nhóm dữ liệu theo giá trị
+        + Cần truy vấn ngẫu nhiên trên toàn bộ dữ liệu
+    - Hàm sử dụng transaction để đảm bảo tính toàn vẹn dữ liệu
+    - Nếu có lỗi xảy ra, toàn bộ transaction sẽ được rollback
+    - Thời gian thực thi của hàm được tính và in ra
+    - Hàm sử dụng PL/pgSQL để thực hiện phân phối dữ liệu hiệu quả
     """
+   
     try:
+        # Bắt đầu tính thời gian thực thi
         start_time = time.time()
         
         con = openconnection
         cur = con.cursor()
         RROBIN_TABLE_PREFIX = 'rrobin_part'
 
-        # Tạo các bảng phân mảnh
+        # Bước 1: Tạo các bảng phân vùng
+        # Mỗi phân vùng sẽ là một bảng riêng biệt với cấu trúc giống nhau
+        # Ví dụ: rrobin_part0, rrobin_part1, rrobin_part2,...
         for i in range(numberofpartitions):
             table_name = RROBIN_TABLE_PREFIX + str(i)
+            # Tạo bảng với 3 cột: userid, movieid, rating
             cur.execute(f"""
                 CREATE TABLE {table_name} (
                     userid INTEGER,
@@ -248,43 +359,62 @@ def roundrobinpartition(ratingstablename, numberofpartitions, openconnection):
                 )
             """)
         
-        # Phân phối dữ liệu theo round robin
+        # Bước 2: Phân phối dữ liệu theo Round Robin
+        # Sử dụng PL/pgSQL để thực hiện phân phối dữ liệu hiệu quả
+        # Cách hoạt động:
+        # 1. Đọc dữ liệu từ bảng gốc và gán số thứ tự cho mỗi bản ghi
+        # 2. Tính toán phân vùng đích dựa trên công thức: row_num % numberofpartitions
+        # 3. Chèn dữ liệu vào phân vùng tương ứng
         query = f"""
         DO $$
         DECLARE
-            target_partition text;
-            row_data record;
+            target_partition text;  -- Tên bảng phân vùng đích
+            row_data record;        -- Bản ghi hiện tại đang xử lý
         BEGIN
+            -- Duyệt qua từng bản ghi trong bảng gốc
             FOR row_data IN 
                 SELECT 
                     userid,
                     movieid,
                     rating,
+                    -- Gán số thứ tự cho mỗi bản ghi, bắt đầu từ 0
                     ROW_NUMBER() OVER (ORDER BY userid, movieid) - 1 as row_num
                 FROM {ratingstablename}
             LOOP
-                -- Tính toán tên bảng phân mảnh
+                -- Bước 2.1: Tính toán tên bảng phân vùng đích
+                -- Công thức: rrobin_part + (row_num % numberofpartitions)
+                -- Ví dụ: nếu row_num = 5 và numberofpartitions = 3
+                -- target_partition = rrobin_part2 (vì 5 % 3 = 2)
                 target_partition := '{RROBIN_TABLE_PREFIX}' || (row_data.row_num % {numberofpartitions})::text;
                 
-                -- Insert dữ liệu vào phân mảnh tương ứng
+                -- Bước 2.2: Chèn dữ liệu vào phân vùng tương ứng
+                -- Sử dụng EXECUTE format để tạo câu lệnh SQL động
+                -- %I được sử dụng để escape tên bảng một cách an toàn
                 EXECUTE format('INSERT INTO %I (userid, movieid, rating) VALUES ($1, $2, $3)', target_partition)
                 USING row_data.userid, row_data.movieid, row_data.rating;
             END LOOP;
         END $$;
         """
         
+        # Thực thi câu lệnh PL/pgSQL để phân phối dữ liệu
         cur.execute(query)
         
-        # Commit và đóng cursor
+        # Bước 3: Hoàn tất transaction
+        # Commit các thay đổi vào database
         openconnection.commit()
         cur.close()
         
-        # Tính và in thời gian thực thi
+        # Bước 4: Tính và in thời gian thực thi
         end_time = time.time()
         execution_time = end_time - start_time
         print(f"Thời gian thực thi hàm roundrobinpartition: {execution_time:.2f} giây")
         
     except Exception as e:
+        # Bước 5: Xử lý lỗi
+        # Nếu có bất kỳ lỗi nào xảy ra trong quá trình thực thi:
+        # 1. Rollback toàn bộ transaction để đảm bảo tính toàn vẹn dữ liệu
+        # 2. In thông báo lỗi
+        # 3. Ném ngoại lệ để thông báo cho người gọi hàm
         openconnection.rollback()
         print("Error: Could not create round robin partitions")
         print(e)
@@ -292,28 +422,58 @@ def roundrobinpartition(ratingstablename, numberofpartitions, openconnection):
 
 def roundrobininsert(ratingstablename, userid, itemid, rating, openconnection):
     """
-    Function to insert a new row into the main table and specific partition based on round robin
-    approach.
+    Hàm chèn một bản ghi rating mới vào hệ thống phân vùng Round Robin.
+    
+    Hàm này thực hiện việc chèn một bản ghi rating mới vào cả bảng gốc và phân vùng tương ứng
+    theo phương pháp Round Robin. Quá trình chèn được thực hiện theo các bước:
+    1. Chèn dữ liệu vào bảng gốc (ratingstablename)
+    2. Xác định phân vùng đích dựa trên tổng số bản ghi sau khi chèn
+    3. Chèn dữ liệu vào phân vùng tương ứng
+    
+    Cách xác định phân vùng:
+    - Đếm tổng số bản ghi trong bảng gốc sau khi chèn
+    - Phân vùng được chọn = (tổng số bản ghi - 1) % số phân vùng
+    - Ví dụ: nếu có 5 phân vùng và tổng số bản ghi là 7
+      -> Phân vùng đích = (7-1) % 5 = 1 (rrobin_part1)
     
     Parameters:
     -----------
     ratingstablename : str
-        Tên bảng ratings
+        Tên bảng chứa dữ liệu ratings gốc
     userid : int
-        ID của user
+        ID của người dùng
     itemid : int
-        ID của movie
+        ID của phim
     rating : float
-        Giá trị rating
+        Giá trị rating (từ 0 đến 5)
     openconnection : psycopg2.extensions.connection
-        Kết nối đến database
+        Kết nối đến database PostgreSQL
+        
+    Returns:
+    --------
+    None
+    
+    Raises:
+    -------
+    Exception
+        - Nếu không thể chèn dữ liệu vào bảng gốc
+        - Nếu không thể chèn dữ liệu vào phân vùng
+        - Nếu bảng gốc hoặc phân vùng không tồn tại
+        - Nếu dữ liệu đầu vào không hợp lệ (ví dụ: rating ngoài khoảng [0,5])
         
     Notes:
     -----
-    - Insert bản ghi vào bảng chính
-    - Xác định bảng con cần insert dựa trên số lượng bản ghi
-    - Insert vào bảng con tương ứng
+    - Hàm đảm bảo dữ liệu được chèn vào cả bảng gốc và phân vùng tương ứng
+    - Phân vùng được chọn dựa trên vị trí của bản ghi mới trong chuỗi Round Robin
+    - Hàm sử dụng transaction để đảm bảo tính toàn vẹn dữ liệu:
+        + Nếu chèn vào bảng gốc thành công nhưng chèn vào phân vùng thất bại -> rollback
+        + Nếu chèn vào phân vùng thành công nhưng commit thất bại -> rollback
+    - Hàm giả định rằng các phân vùng đã được tạo trước đó bằng hàm roundrobinpartition
+    - Số lượng phân vùng được xác định tự động bằng cách đếm các bảng có prefix 'rrobin_part'
+    - Hàm sử dụng PL/pgSQL để thực hiện chèn dữ liệu vào phân vùng một cách an toàn
+    - Cần đảm bảo rằng userid và itemid không trùng lặp trong bảng gốc (primary key)
     """
+   
     con = openconnection
     cur = con.cursor()
     RROBIN_TABLE_PREFIX = 'rrobin_part'
@@ -359,79 +519,121 @@ def roundrobininsert(ratingstablename, userid, itemid, rating, openconnection):
 
 def rangeinsert(ratingstablename, userid, itemid, rating, openconnection):
     """
-    Function to insert a new row into the main table and specific partition based on range rating.
-    Sử dụng truy vấn SQL để xác định phân mảnh và insert dữ liệu
+    Hàm chèn một bản ghi rating mới vào hệ thống phân vùng theo khoảng giá trị (Range Partitioning).
+    
+    Hàm này thực hiện việc chèn một bản ghi rating mới vào cả bảng gốc và phân vùng tương ứng
+    dựa trên giá trị rating. Phân vùng được chọn dựa trên khoảng giá trị mà rating thuộc vào.
+    
+    Cách xác định phân vùng:
+    - Khoảng giá trị tổng thể của rating là [0, 5]
+    - Khoảng này được chia đều thành N phần (N = số phân vùng)
+    - Phân vùng đầu tiên: [min_range, max_range]
+    - Các phân vùng còn lại: (min_range, max_range]
+    - Ví dụ với 5 phân vùng:
+        + range_part0: [0.0, 1.0]
+        + range_part1: (1.0, 2.0]
+        + range_part2: (2.0, 3.0]
+        + range_part3: (3.0, 4.0]
+        + range_part4: (4.0, 5.0]
     
     Parameters:
     -----------
     ratingstablename : str
-        Tên bảng ratings
+        Tên bảng chứa dữ liệu ratings gốc
     userid : int
-        ID của user
+        ID của người dùng
     itemid : int
-        ID của movie
+        ID của phim
     rating : float
-        Giá trị rating
+        Giá trị rating (từ 0 đến 5)
+        Lưu ý: giá trị này quyết định phân vùng sẽ chèn vào
     openconnection : psycopg2.extensions.connection
-        Kết nối đến database
+        Kết nối đến database PostgreSQL
+        
+    Returns:
+    --------
+    None
+    
+    Raises:
+    -------
+    Exception
+        - Nếu không thể chèn dữ liệu vào bảng gốc
+        - Nếu không thể chèn dữ liệu vào phân vùng
+        - Nếu bảng gốc hoặc phân vùng không tồn tại
+        - Nếu rating ngoài khoảng [0,5]
+        - Nếu không tìm thấy phân vùng phù hợp cho giá trị rating
         
     Notes:
     -----
-    - Xác định bảng con dựa trên giá trị rating
-    - Insert vào bảng con tương ứng
+    - Hàm đảm bảo dữ liệu được chèn vào cả bảng gốc và phân vùng tương ứng
+    - Phân vùng được chọn dựa trên giá trị rating của bản ghi
+    - Hàm sử dụng transaction để đảm bảo tính toàn vẹn dữ liệu:
+        + Nếu chèn vào bảng gốc thành công nhưng chèn vào phân vùng thất bại -> rollback
+        + Nếu chèn vào phân vùng thành công nhưng commit thất bại -> rollback
+    - Hàm giả định rằng các phân vùng đã được tạo trước đó bằng hàm rangepartition
+    - Số lượng phân vùng được xác định tự động bằng cách đếm các bảng có prefix 'range_part'
+    - Hàm sử dụng PL/pgSQL để thực hiện chèn dữ liệu vào phân vùng một cách an toàn
+    - Cần đảm bảo rằng userid và itemid không trùng lặp trong bảng gốc (primary key)
+    - Việc chèn dữ liệu vào phân vùng phù hợp giúp duy trì tính nhất quán của hệ thống phân vùng
+    - Hàm tự động xử lý các trường hợp đặc biệt như rating = 0 (phân vùng đầu tiên)
     """
+   
     con = openconnection
     cur = con.cursor()
     RANGE_TABLE_PREFIX = 'range_part'
+    # Bước 1: Xác định số lượng phân vùng hiện có
     numberofpartitions = count_partitions(RANGE_TABLE_PREFIX, openconnection)
+    # Bước 2: Tính độ rộng của mỗi phân vùng
+    # Ví dụ: với 5 phân vùng, delta = 1.0
+    # Tạo ra các khoảng: [0,1], (1,2], (2,3], (3,4], (4,5]
     delta = 5.0 / numberofpartitions
     
-    # Tạo truy vấn SQL để xác định phân mảnh và insert dữ liệu
+    # Bước 3: Tạo và thực thi câu lệnh PL/pgSQL để chèn dữ liệu
+    # Sử dụng PL/pgSQL để thực hiện chèn dữ liệu một cách an toàn và hiệu quả
     query = f"""
     DO $$
     DECLARE
-        target_partition text;
+        target_partition text;  -- Biến lưu tên phân vùng đích
     BEGIN
+        -- Bước 3.1: Tạo bảng tạm chứa thông tin về các phân vùng
+        -- Mỗi dòng chứa: index phân vùng, giá trị min, giá trị max
         WITH partition_ranges AS (
             SELECT 
-                generate_series(0, {numberofpartitions-1}) as partition_index,
-                generate_series(0, {numberofpartitions-1}) * {delta} as min_range,
-                (generate_series(0, {numberofpartitions-1}) + 1) * {delta} as max_range
+                generate_series(0, {numberofpartitions-1}) as partition_index,  -- Tạo dãy số từ 0 đến numberofpartitions-1
+                generate_series(0, {numberofpartitions-1}) * {delta} as min_range,  -- Tính giá trị min của mỗi phân vùng
+                (generate_series(0, {numberofpartitions-1}) + 1) * {delta} as max_range  -- Tính giá trị max của mỗi phân vùng
         )
+        -- Bước 3.2: Tìm phân vùng phù hợp cho giá trị rating
+        -- Sử dụng CASE để xử lý đặc biệt cho phân vùng đầu tiên
         SELECT '{RANGE_TABLE_PREFIX}' || partition_index::text INTO target_partition
         FROM partition_ranges
         WHERE 
             CASE 
+                -- Phân vùng đầu tiên (index = 0): bao gồm cả giá trị min
+                -- Ví dụ: [0.0, 1.0] nếu delta = 1.0
                 WHEN partition_index = 0 THEN {rating} >= min_range AND {rating} <= max_range
+                -- Các phân vùng còn lại: không bao gồm giá trị min
+                -- Ví dụ: (1.0, 2.0], (2.0, 3.0],...
                 ELSE {rating} > min_range AND {rating} <= max_range
             END
-        LIMIT 1;
+        LIMIT 1;  -- Chỉ lấy phân vùng đầu tiên thỏa mãn điều kiện
 
+        -- Bước 3.3: Chèn dữ liệu vào phân vùng đã xác định
+        -- Sử dụng EXECUTE format để tạo câu lệnh SQL động
+        -- %I được sử dụng để escape tên bảng một cách an toàn
         EXECUTE format('INSERT INTO %I (userid, movieid, rating) VALUES ($1, $2, $3)', target_partition)
         USING {userid}, {itemid}, {rating};
     END $$;
     """
     
+    # Bước 4: Thực thi câu lệnh PL/pgSQL
     cur.execute(query)
     cur.close()
+    # Bước 5: Commit transaction để lưu thay đổi
     con.commit()
 
 def create_db(dbname):
-    """
-    We create a DB by connecting to the default user and database of Postgres
-    The function first checks if an existing database exists for a given name, else creates it.
-    
-    Parameters:
-    -----------
-    dbname : str
-        Tên database cần tạo
-        
-    Notes:
-    -----
-    - Kết nối đến database mặc định
-    - Tạo database mới với tên được chỉ định
-    - Đóng kết nối
-    """
+   
     # Connect to the default database
     con = getopenconnection(dbname='postgres')
     con.set_isolation_level(psycopg2.extensions.ISOLATION_LEVEL_AUTOCOMMIT)
@@ -451,26 +653,7 @@ def create_db(dbname):
     con.close()
 
 def count_partitions(prefix, openconnection):
-    """
-    Function to count the number of tables which have the @prefix in their name somewhere.
-    
-    Parameters:
-    -----------
-    prefix : str
-        Prefix của tên bảng cần đếm
-    openconnection : psycopg2.extensions.connection
-        Kết nối đến database
-        
-    Returns:
-    --------
-    int
-        Số lượng bảng con có prefix được chỉ định
-        
-    Notes:
-    -----
-    - Truy vấn pg_stat_user_tables để đếm số bảng
-    - Chỉ đếm các bảng có tên bắt đầu bằng prefix
-    """
+   
     con = openconnection
     cur = con.cursor()
     cur.execute("select count(*) from pg_stat_user_tables where relname like " + "'" + prefix + "%';")
